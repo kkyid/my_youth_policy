@@ -1,0 +1,37 @@
+# ==========================================================
+# Seoul Youth/Newlywed Housing Policy RAG Lab
+# Python 3.11+ / 핵심 의존성만 명시 (이미 pyproject.toml 이 있다면 uv sync 권장)
+# ==========================================================
+
+# --- Streamlit UI ---
+streamlit>=1.35,<2.0
+
+# --- LangChain (LCEL) ---
+langchain>=0.3,<1.0
+langchain-core>=0.3,<1.0
+langchain-community>=0.3,<1.0
+langchain-openai>=0.2,<1.0
+langchain-experimental>=0.3,<1.0
+langchain-text-splitters>=0.3,<1.0
+langchain-chroma>=0.1,<1.0
+
+# --- LLM / Embeddings ---
+openai>=1.30,<3.0
+tiktoken>=0.7,<1.0
+
+# --- Vector DB ---
+chromadb>=0.5,<1.0
+
+# --- 평가 (선택, 시뮬레이션 외 실 ragas 사용 시) ---
+ragas>=0.4,<0.5
+
+# --- 문서 처리 ---
+pypdf>=4.0,<5.0
+pymupdf>=1.24,<2.0
+pymupdf4llm>=0.0.10
+pdfplumber>=0.11,<1.0
+
+# --- 기타 ---
+pandas>=2.0,<3.0
+python-dotenv>=1.0,<2.0
+pydantic>=2.0,<3.0

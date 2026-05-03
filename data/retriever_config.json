@@ -1,0 +1,52 @@
+{
+  "alias": "combined_search",
+  "preprocessing": {
+    "self_query": {
+      "enabled": false,
+      "prompt": ""
+    },
+    "query_transform": {
+      "method": "없음",
+      "prompts": {
+        "HyDE": "아래 사용자 질문에 대한 답이 될 만한 가상의 정책 문서 단락을 작성하세요.\n서울시 청년/신혼부부 주택·금융 정책 형식을 따르세요.\n실제로 존재하는 것처럼 구체적으로 작성하되, 300자 이내로 작성하세요.\n\n[사용자 질문]\n{question}\n\n[가상 정책 문서]\n",
+        "Multi-Query": "",
+        "Decomposition": ""
+      }
+    }
+  },
+  "units": [
+    {
+      "type": "VectorStore",
+      "k": 5,
+      "search_type": "mmr",
+      "active": true,
+      "weight": 0.3,
+      "lambda_mult": 0.5,
+      "score_threshold": 0.5
+    },
+    {
+      "type": "BM25",
+      "k": 5,
+      "search_type": "similarity",
+      "active": true,
+      "weight": 0.7,
+      "lambda_mult": 0.5,
+      "score_threshold": 0.5
+    },
+    {
+      "type": "미설정",
+      "k": 5,
+      "search_type": "미설정",
+      "active": false,
+      "weight": 1.0,
+      "lambda_mult": 0.5,
+      "score_threshold": 0.5
+    }
+  ],
+  "reranker": {
+    "enabled": false,
+    "type": "Cross-Encoder",
+    "model": "bongsoo/kpf-cross-encoder-v1",
+    "final_k": 3
+  }
+}
