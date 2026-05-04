@@ -44,23 +44,49 @@ except Exception:
 LLM_MODEL = "gpt-4o-mini"
 
 METADATA_FIELDS = [
-    # ── 정책 기본 ──────────────────────────────
-    "category",          # "주택" | "금융"
-    "title",             # 정책 공식 명칭
-    "source_url",        # 공식 신청 URL
-    "application_period",# 신청 기간 (텍스트)
-    "support_type",      # 지원 내용·금액 요약 (텍스트)
-    "housing_limit",     # 보증금/월세 상한 (텍스트)
-    "is_repeat_allowed", # 재신청 가능 여부 (텍스트)
-    # ── Self-Query 필터용 정규화 필드 ──────────
-    "age_min",           # 최소 연령 (int, 없으면 0)
-    "age_max",           # 최대 연령 (int, 없으면 99)
-    "income_pct",        # 기준 중위소득 % 상한 (int, 없으면 0)
-    "income_max",        # 연소득 상한 만원 (int, 없으면 0)
-    "asset_max",         # 순자산 상한 만원 (int, 없으면 0)
-    "household_type",    # "1인가구" | "신혼부부" | "한부모가족" | "청년" | "무관"
-    "housing_type",      # "전세" | "월세" | "매입" | "임대주택" | "무관"
-    "district",          # 서울 자치구 (예: "강남구"), 전체면 "서울특별시"
+    # ── 정책 기본 ──────────────────────────────────────────────
+    "doc_id",             # 정책 ID (예: "2025-000407")
+    "title",              # 정책 공식 명칭
+    "category",           # "주택" | "금융"
+    "policy_type",        # "housing" | "finance"
+    "source",             # 출처 파일명
+    "source_url",         # 공식 신청 URL (없으면 "")
+    "summary",            # 정책 한줄 요약
+    "tags",               # 관련 키워드 리스트
+    "target",             # 지원 대상 리스트 (예: ["청년", "신혼부부"])
+    
+    # ── 공통 자격 조건 ────────────────────────────────────────
+    "age_min",            # 최소 연령 (int, 없으면 null)
+    "age_max",            # 최대 연령 (int, 없으면 null)
+    "marital_status",     # "무관" | "미혼" | "기혼" | "신혼부부"
+    "income_condition",   # 소득 자격 조건 텍스트 (예: "중위소득 150% 이하")
+    "income_max_man",     # 연소득 또는 월소득 상한 (만원, int, 없으면 null)
+    "asset_max_man",      # 순자산 상한 (만원, int, 없으면 null)
+    "region",             # 지역 (예: "서울 도봉구", 전체면 "서울")
+    
+    # ── 주택 정책 전용 ─────────────────────────────────────────
+    "is_homeless",           # 무주택 여부 필항 (bool/null)
+    "housing_type",          # 주택 유형 (예: "국민임대주택", "행복주택", "전세")
+    "supply_type",           # 공급 유형 (예: "예비입주자 모집", "일반공급")
+    "contract_type",         # 계약 형태 (예: "임대", "분양")
+    "support_type",          # 지원 형태 리스트
+    "deposit_support",       # 보증금 지원 여부 (bool)
+    "monthly_rent_support",  # 월세 지원 여부 (bool)
+    "max_deposit",           # 최대 보증금 (원, int, 없으면 0)
+    "max_monthly_rent",      # 최대 월세 (원, int, 없으면 0)
+    "residence_requirement", # 거주 요건/기간 텍스트
+    "priority_condition",    # 우선 순위 조건 리스트
+    "duration",              # 지원/거주 기간
+    "application_period",    # 신청 기간 텍스트
+    
+    # ── 금융 정책 전용 ─────────────────────────────────────────
+    "requires_no_house",  # 무주택 필수 여부 (bool)
+    "is_first_purchase",  # 생애 최초 구입 여부 (bool)
+    "loan_limit_man",     # 대출/지원 한도 (만원, int, 없으면 0)
+    "loan_type",          # 대출 유형 (예: "전세자금대출", "이자지원")
+    "interest_rate_min",  # 최저 금리 (float, 없으면 0.0)
+    "interest_rate_max",  # 최고 금리 (float, 없으면 0.0)
+    "special_condition",  # 특이 사항 리스트
 ]
 
 DEFAULT_POLICY_FIELDS = [
@@ -843,70 +869,96 @@ def apply_secondary_chunking(
 # 6) LLM 메타데이터 추출 + 결합
 # =============================================================================
 METADATA_PROMPT = """\
-당신은 서울시 청년/신혼부부 정책 데이터 추출 전문가입니다.
+당신은 서울시 청년/신혼부부 주택·금융 정책 데이터 추출 전문가입니다.
 아래 정책 청크에서 메타데이터를 JSON 으로 **정확하고 정규화하여** 추출하세요.
 
 [공통 규칙]
 - 청크에 명시된 정보만 사용하세요. 추측·창작 금지.
 - 모든 키를 반드시 포함해야 합니다.
-- 숫자 필드(age_min/age_max/income_pct/income_max/asset_max)는 반드시 정수(int)로 출력하세요.
-- 범주형 필드는 정해진 값 중 하나만 사용하세요.
+- 수치 필드는 정수(int) 또는 실수(float)로 출력하고, 정보가 없으면 null 또는 0을 사용하세요.
+- 불리언(bool) 필드는 true/false로 출력하세요.
+- 리스트(list) 필드는 ["항목1", "항목2"] 형식으로 출력하세요.
 
 [필드별 추출 규칙]
-
-▶ 기본 정보 (텍스트)
-- title: 정책의 공식 명칭 (예: "2025년 서울시 청년월세지원")
+- doc_id: 공고번호 또는 주택관리번호 (예: "2026-1109", 없으면 "")
+- title: 정책의 공식 명칭
+- category: "주택" 또는 "금융" (이미 제공된 category 우선 사용)
+- policy_type: "housing" 또는 "finance"
 - source_url: 공식 신청 URL (없으면 "")
-- application_period: 신청 기간 텍스트 (예: "2025.06.11~06.24", 없으면 "")
-- support_type: 지원 내용·금액 요약 (예: "월 최대 20만원, 최대 12개월", 없으면 "")
-- housing_limit: 보증금/월세 상한 텍스트 (예: "보증금 8천만원 이하 / 월세 60만원 이하", 없으면 "")
-- is_repeat_allowed: 재신청 가능 여부 (예: "생애 1회", "기수혜자 불가", 없으면 "")
+- summary: 정책 핵심 내용 1~2문장 요약
+- tags: 관련 키워드 리스트
+- target: 지원 대상 리스트 (예: ["청년", "신혼부부"])
 
-▶ 연령 (int)
-- age_min: 지원 가능 최소 연령. "만 19세 이상" → 19. 없으면 0.
-- age_max: 지원 가능 최대 연령. "만 39세 이하" → 39. 없으면 99.
-  ※ "청년(19~39세)" 표현이면 age_min=19, age_max=39
+- age_min: 최소 연령 (int, 없으면 null)
+- age_max: 최대 연령 (int, 없으면 null)
+- marital_status: "무관" | "미혼" | "기혼" | "신혼부부" 중 하나
+- income_condition: 소득 자격 조건 설명 (예: "중위소득 150% 이하")
+- income_max_man: 소득 상한액 (단위: 만원, int, 없으면 null). 예: 월 634만원 -> 634
+- asset_max_man: 순자산 상한액 (단위: 만원, int, 없으면 null). 예: 3억 4500만원 -> 34500
+- region: 지원 지역 (예: "서울 도봉구", "서울")
 
-▶ 소득·자산 (int)
-- income_pct: 기준 중위소득 상한 %. "중위소득 150% 이하" → 150. 없으면 0.
-- income_max: 연소득 상한 (단위: 만원). "연소득 5천만원 이하" → 5000. 없으면 0.
-  ※ 중위소득 % 기준이면 income_max=0
-- asset_max: 순자산 상한 (단위: 만원). "순자산 3억 4500만원 이하" → 34500. 없으면 0.
+- is_homeless: 무주택자 여부 필수인 경우 true, 아니면 false, 정보 없으면 null (주택 정책용)
+- housing_type: 주택 유형 (예: "국민임대주택", "전세", "월세")
+- supply_type: 공급 유형 (예: "예비입주자 모집", "일반공급")
+- contract_type: 계약 형태 ("임대", "분양", "")
+- support_type: 지원 형태 리스트
+- deposit_support: 보증금 지원 여부 (bool)
+- monthly_rent_support: 월세 지원 여부 (bool)
+- max_deposit: 최대 지원 보증금 (단위: 원, int, 없으면 0)
+- max_monthly_rent: 최대 지원 월세 (단위: 원, int, 없으면 0)
+- residence_requirement: 거주 요건 설명
+- priority_condition: 우선 선발 조건 리스트
+- duration: 지원 기간 설명 (예: "최장 30년")
+- application_period: 신청 기간 (예: "2026.04.01~04.14")
 
-▶ 가구 유형 (범주형)
-- household_type: 다음 중 하나만 선택.
-  "1인가구" | "신혼부부" | "한부모가족" | "청년" | "무관"
-  ※ 명시 없거나 제한 없으면 "무관"
-  ※ 청년 1인가구처럼 중복이면 "청년" 우선
-
-▶ 주거 유형 (범주형)
-- housing_type: 다음 중 하나만 선택.
-  "전세" | "월세" | "매입" | "임대주택" | "무관"
-  ※ 전·월세 모두면 "월세" (더 제한적인 것)
-  ※ 명시 없으면 "무관"
-
-▶ 지역 (텍스트)
-- district: 특정 자치구 지정이면 그 구명 (예: "강남구"). 서울 전체면 "서울특별시".
+- requires_no_house: 무주택 필수 여부 (bool, 금융 정책용)
+- is_first_purchase: 생애 최초 구입 여부 (bool)
+- loan_limit_man: 대출/지원 한도액 (단위: 만원, int, 없으면 0)
+- loan_type: 대출/지원 유형
+- interest_rate_min: 최저 금리 (float)
+- interest_rate_max: 최고 금리 (float)
+- special_condition: 특이 사항 리스트
 
 [정책 청크]
 {chunk}
 
 [출력 - JSON 만, 다른 텍스트 금지]
 {{
+  "doc_id": "",
   "title": "",
+  "category": "",
+  "policy_type": "",
   "source_url": "",
+  "summary": "",
+  "tags": [],
+  "target": [],
+  "age_min": null,
+  "age_max": null,
+  "marital_status": "무관",
+  "income_condition": "",
+  "income_max_man": null,
+  "asset_max_man": null,
+  "region": "서울",
+  "is_homeless": null,
+  "housing_type": "",
+  "supply_type": "",
+  "contract_type": "",
+  "support_type": [],
+  "deposit_support": false,
+  "monthly_rent_support": false,
+  "max_deposit": 0,
+  "max_monthly_rent": 0,
+  "residence_requirement": "",
+  "priority_condition": [],
+  "duration": "",
   "application_period": "",
-  "support_type": "",
-  "housing_limit": "",
-  "is_repeat_allowed": "",
-  "age_min": 0,
-  "age_max": 99,
-  "income_pct": 0,
-  "income_max": 0,
-  "asset_max": 0,
-  "household_type": "무관",
-  "housing_type": "무관",
-  "district": "서울특별시"
+  "requires_no_house": false,
+  "is_first_purchase": false,
+  "loan_limit_man": 0,
+  "loan_type": "",
+  "interest_rate_min": 0.0,
+  "interest_rate_max": 0.0,
+  "special_condition": []
 }}
 """
 
@@ -928,29 +980,57 @@ def extract_chunk_metadata(
     """청크 1개에서 정책 메타데이터 JSON 추출. category 강제 주입."""
     from langchain_openai import ChatOpenAI
 
-    llm = ChatOpenAI(model=model, temperature=0)
+    llm = ChatOpenAI(model=model, temperature=0, max_retries=3, request_timeout=60)
     chain = ChatPromptTemplate.from_template(METADATA_PROMPT) | llm | StrOutputParser()
     raw = chain.invoke({"chunk": (chunk_text or "")[:6000]})
     parsed = _extract_json_obj(raw) or {}
 
-    INT_FIELDS = {"age_min", "age_max", "income_pct", "income_max", "asset_max"}
-    DEFAULTS   = {"age_min": 0, "age_max": 99, "income_pct": 0,
-                  "income_max": 0, "asset_max": 0,
-                  "household_type": "무관", "housing_type": "무관",
-                  "district": "서울특별시"}
+    INT_FIELDS = {
+        "age_min", "age_max", "income_max_man", "asset_max_man", 
+        "max_deposit", "max_monthly_rent", "loan_limit_man"
+    }
+    FLOAT_FIELDS = {"interest_rate_min", "interest_rate_max"}
+    BOOL_FIELDS = {"is_homeless", "requires_no_house", "is_first_purchase", "deposit_support", "monthly_rent_support"}
+    LIST_FIELDS = {"tags", "target", "support_type", "priority_condition", "special_condition"}
+
+    DEFAULTS = {
+        "age_min": None, "age_max": None, "income_max_man": None, "asset_max_man": None,
+        "marital_status": "무관", "region": "서울",
+        "is_homeless": None, "requires_no_house": False, "is_first_purchase": False,
+        "deposit_support": False, "monthly_rent_support": False,
+        "max_deposit": 0, "max_monthly_rent": 0, "loan_limit_man": 0
+    }
 
     out: Dict[str, Any] = {"category": category}
     for k in METADATA_FIELDS:
         if k == "category":
             continue
-        v = parsed.get(k, DEFAULTS.get(k, ""))
+        v = parsed.get(k, DEFAULTS.get(k))
+        
         if k in INT_FIELDS:
             try:
-                out[k] = int(v)
+                out[k] = int(v) if v is not None else None
             except (TypeError, ValueError):
-                out[k] = DEFAULTS[k]
+                out[k] = DEFAULTS.get(k)
+        elif k in FLOAT_FIELDS:
+            try:
+                out[k] = float(v) if v is not None else 0.0
+            except (TypeError, ValueError):
+                out[k] = 0.0
+        elif k in BOOL_FIELDS:
+            if isinstance(v, bool):
+                out[k] = v
+            elif isinstance(v, str):
+                out[k] = v.lower() == "true"
+            else:
+                out[k] = DEFAULTS.get(k)
+        elif k in LIST_FIELDS:
+            if isinstance(v, list):
+                out[k] = v
+            else:
+                out[k] = []
         else:
-            out[k] = DEFAULTS.get(k, "") if v is None else str(v)
+            out[k] = str(v) if v is not None else ""
     return out
 
 
@@ -961,35 +1041,33 @@ def combine_chunk_payload(
 ) -> str:
     """[문서 전체 요약] + [메타데이터 요약] + [원본 청크] 결합."""
     label_map = {
-        "category":          "분류",
         "title":             "정책명",
-        "source_url":        "공식 URL",
+        "doc_id":            "공고번호",
+        "category":          "분류",
         "application_period":"신청 기간",
-        "support_type":      "지원 내용",
-        "housing_limit":     "주거 한도",
-        "is_repeat_allowed": "재신청 여부",
         "age_min":           "최소 연령",
         "age_max":           "최대 연령",
-        "income_pct":        "중위소득 % 상한",
-        "income_max":        "연소득 상한(만원)",
-        "asset_max":         "순자산 상한(만원)",
-        "household_type":    "가구 유형",
-        "housing_type":      "주거 유형",
-        "district":          "지역구",
+        "marital_status":    "혼인 상태",
+        "income_condition":  "소득 조건",
+        "income_max_man":    "소득 상한(만원)",
+        "asset_max_man":     "순자산 상한(만원)",
+        "region":            "지역",
+        "housing_type":      "주택 유형",
+        "loan_limit_man":    "한도(만원)",
     }
     meta_lines = []
-    for k in METADATA_FIELDS:
-        v = (metadata or {}).get(k, "")
-        if not v:
+    for k, label in label_map.items():
+        v = (metadata or {}).get(k)
+        if v is None or v == "" or v == 0:
             continue
-        meta_lines.append(f"- {label_map.get(k, k)}: {v}")
-    meta_block = "\n".join(meta_lines) if meta_lines else "- (추출된 메타데이터 없음)"
+        meta_lines.append(f"- {label}: {v}")
+    meta_block = "\n".join(meta_lines) if meta_lines else "- (주요 메타데이터 없음)"
 
     parts = [
         "[문서 전체 요약]",
         (full_summary or "(요약 없음)").strip(),
         "",
-        "[메타데이터]",
+        "[메타데이터 요약]",
         meta_block,
         "",
         "[원본 청크]",

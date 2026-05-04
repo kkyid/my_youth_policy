@@ -20,11 +20,14 @@ DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 ROOT_DIR = DATA_DIR.parent
 load_dotenv(ROOT_DIR / ".env")
 
-PERSIST_DIR = DATA_DIR / "chroma"
-PERSIST_DIR.mkdir(parents=True, exist_ok=True)
+# 주택·금융 DB는 별도 디렉토리에 분리 저장
+HOUSING_DB_DIR = DATA_DIR / "db" / "chroma_db_v2"
+FINANCE_DB_DIR  = DATA_DIR / "db" / "chroma_finance"
+HOUSING_DB_DIR.mkdir(parents=True, exist_ok=True)
+FINANCE_DB_DIR.mkdir(parents=True, exist_ok=True)
 
-HOUSING_COLLECTION = "policy_housing"
-FINANCE_COLLECTION = "policy_finance"
+HOUSING_COLLECTION = "youth_housing_policy"
+FINANCE_COLLECTION = "youth_finance_policy"
 DEFAULT_EMBED_MODEL = "text-embedding-3-small"
 
 
@@ -33,17 +36,21 @@ def get_embeddings(model: Optional[str] = None) -> OpenAIEmbeddings:
     return OpenAIEmbeddings(model=model or DEFAULT_EMBED_MODEL, api_key=api_key)
 
 
+def _db_dir(collection: str) -> Path:
+    """컬렉션 이름으로 해당 DB 디렉토리를 반환."""
+    if collection == FINANCE_COLLECTION:
+        return FINANCE_DB_DIR
+    return HOUSING_DB_DIR
+
+
 def get_vectorstore(collection: str, embeddings: Optional[OpenAIEmbeddings] = None) -> Chroma:
-    import chromadb
     from chromadb.config import Settings
     embeddings = embeddings or get_embeddings()
-    
-    # 명시적으로 PersistentClient를 생성하며 테넌트와 데이터베이스를 지정합니다.
     client = chromadb.PersistentClient(
-        path=str(PERSIST_DIR),
+        path=str(_db_dir(collection)),
         settings=Settings(anonymized_telemetry=False),
         tenant="default_tenant",
-        database="default_database"
+        database="default_database",
     )
     return Chroma(
         client=client,

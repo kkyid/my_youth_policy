@@ -14,7 +14,7 @@ from langchain.retrievers import (
     MultiQueryRetriever,
     EnsembleRetriever,
 )
-from langchain.retrievers.document_compressors import CrossEncoderReranker
+from langchain.retrievers.document_compressors import CrossEncoderReranker, LLMChainExtractor
 from langchain_community.retrievers import BM25Retriever
 from langchain_community.cross_encoders import HuggingFaceCrossEncoder
 from langchain_core.documents import Document
@@ -47,6 +47,8 @@ RETRIEVER_CONFIG_FILE = DATA_DIR / "retriever_config.json"
 
 # ── 기본 설정 ─────────────────────────────────────────────────────
 DEFAULT_CONFIG: Dict[str, Any] = {
+    "alias":         "combined_search",
+    "llm_model":     "gpt-4o-mini",
     "units": [
         {
             "type": "VectorStore", "k": 5, "search_type": "similarity",
@@ -69,6 +71,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "type": "Cross-Encoder",
         "model": "bongsoo/kpf-cross-encoder-v1",   # 한국어 모델 기본값
         "final_k": 3,
+    },
+    "extractor": {
+        "enabled": False,
+        "model": "gpt-4o-mini",
     },
     "preprocessing": {
         "self_query": {
@@ -106,6 +112,20 @@ def save_retriever_config(cfg: Dict[str, Any]) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     with RETRIEVER_CONFIG_FILE.open("w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+
+def get_global_model() -> str:
+    """전체 프로젝트에서 사용할 글로벌 LLM 모델명을 반환 (기본값: gpt-4o-mini)."""
+    cfg = load_retriever_config()
+    # 누락된 경우 기본값 gpt-4o-mini 반환
+    return cfg.get("llm_model", DEFAULT_CONFIG["llm_model"])
+
+
+def set_global_model(model_name: str) -> None:
+    """글로벌 LLM 모델명을 설정 파일에 영구 저장."""
+    cfg = load_retriever_config()
+    cfg["llm_model"] = model_name
+    save_retriever_config(cfg)
 
 
 # ── 유틸 ─────────────────────────────────────────────────────────
@@ -202,9 +222,20 @@ def build_retriever(vectorstore: Chroma, config: Dict[str, Any], metadata_filter
 
         elif utype == "Self-Querying Retriever":
             metadata_field_info = [
-                AttributeInfo(name="category", description="정책 분류 (주택, 금융 등)", type="string"),
-                AttributeInfo(name="title",    description="정책의 공식 명칭",          type="string"),
-                AttributeInfo(name="region",   description="지원 가능 지역",            type="string"),
+                AttributeInfo(name="title",             description="정책/상품명",                               type="string"),
+                AttributeInfo(name="category",          description="정책 분류: '주택' 또는 '금융'",              type="string"),
+                AttributeInfo(name="region",            description="지원 가능 지역 (예: '서울 도봉구', '서울')",  type="string"),
+                AttributeInfo(name="target",            description="지원 대상자: '청년', '신혼부부' 등",         type="string"),
+                AttributeInfo(name="age_min",           description="지원 가능 최소 연령",                       type="integer"),
+                AttributeInfo(name="age_max",           description="지원 가능 최대 연령",                       type="integer"),
+                AttributeInfo(name="marital_status",    description="혼인 조건: '미혼', '기혼', '예비신혼부부', '무관'", type="string"),
+                AttributeInfo(name="requires_no_house", description="무주택 조건 여부 (금융)",                   type="boolean"),
+                AttributeInfo(name="is_homeless",       description="무주택 필수 여부 (주택)",                   type="boolean"),
+                AttributeInfo(name="income_max_man",    description="소득 상한 (단위: 만원)",                    type="integer"),
+                AttributeInfo(name="loan_limit_man",    description="최대 대출/지원 한도 (단위: 만원)",           type="integer"),
+                AttributeInfo(name="asset_max_man",     description="자산 상한 (단위: 만원)",                    type="integer"),
+                AttributeInfo(name="is_first_purchase", description="생애 최초 구매 조건 여부",                   type="boolean"),
+                AttributeInfo(name="housing_type",      description="주택 유형 (예: '국민임대주택', '전세')",     type="string"),
             ]
             llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
             retriever = SelfQueryRetriever.from_llm(
@@ -246,19 +277,32 @@ def build_retriever(vectorstore: Chroma, config: Dict[str, Any], metadata_filter
     else:
         base_retriever = active_retrievers[0]
 
-    # 2단계: 리랭커 (직렬)
+    # 2단계: 리랭커 (Cross-Encoder 순위 재조정)
     rerank_cfg = cfg.get("reranker", DEFAULT_CONFIG["reranker"])
     if rerank_cfg.get("enabled"):
         try:
             model_name = rerank_cfg.get("model", "bongsoo/kpf-cross-encoder-v1")
             model      = load_cross_encoder(model_name)
             compressor = CrossEncoderReranker(model=model, top_n=int(rerank_cfg.get("final_k", 3)))
-            return ContextualCompressionRetriever(
+            base_retriever = ContextualCompressionRetriever(
                 base_compressor=compressor,
                 base_retriever=base_retriever,
             )
         except Exception as e:
             logging.error(f"Reranker 초기화 실패: {e}")
-            return base_retriever
+
+    # 3단계: LLM-Extractor (핵심 내용 추출 — 리랭커 이후 적용)
+    extractor_cfg = cfg.get("extractor", DEFAULT_CONFIG["extractor"])
+    if extractor_cfg.get("enabled"):
+        try:
+            ext_model  = extractor_cfg.get("model", "gpt-4o-mini")
+            ext_llm    = ChatOpenAI(model=ext_model, temperature=0)
+            ext_compressor = LLMChainExtractor.from_llm(ext_llm)
+            return ContextualCompressionRetriever(
+                base_compressor=ext_compressor,
+                base_retriever=base_retriever,
+            )
+        except Exception as e:
+            logging.error(f"LLM-Extractor 초기화 실패: {e}")
 
     return base_retriever

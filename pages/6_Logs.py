@@ -52,6 +52,16 @@ st.markdown("""
     border-radius:5px; padding:2px 8px; margin-top:4px;
     font-size:0.78rem; color:#94A3B8; white-space:nowrap;
 }
+.log-table .extract-on {
+    display:inline-block; background:#FFF7ED; border:1px solid #FED7AA;
+    border-radius:5px; padding:2px 8px; margin-top:4px;
+    font-size:0.78rem; color:#C2410C; font-weight:600; white-space:nowrap;
+}
+.log-table .extract-off {
+    display:inline-block; background:#F8FAFC; border:1px solid #E2E8F0;
+    border-radius:5px; padding:2px 8px; margin-top:4px;
+    font-size:0.78rem; color:#94A3B8; white-space:nowrap;
+}
 .log-table .preproc-badge {
     display:inline-block; background:#ECFDF5; border:1px solid #A7F3D0;
     border-radius:5px; padding:2px 8px; margin-bottom:3px;
@@ -155,6 +165,12 @@ def fmt_retrievers_html(cfg) -> str:
         html += f'<div><span class="rerank-on">Reranker●ON top{rerank.get("final_k","?")}</span></div>'
     else:
         html += '<div><span class="rerank-off">Reranker○OFF</span></div>'
+    extractor = cfg.get("extractor", {})
+    if extractor.get("enabled"):
+        ext_model = extractor.get("model", "gpt-4o-mini")
+        html += f'<div><span class="extract-on">LLM-Extract●ON ({ext_model})</span></div>'
+    else:
+        html += '<div><span class="extract-off">LLM-Extract○OFF</span></div>'
     return html
 
 
@@ -182,6 +198,8 @@ def _retriever_label(cfg) -> str:
         label += " / SQ"
     if cfg.get("reranker", {}).get("enabled"):
         label += " / Rerank"
+    if cfg.get("extractor", {}).get("enabled"):
+        label += " / Extract"
     return label
 
 

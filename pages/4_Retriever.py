@@ -24,6 +24,7 @@ render_page_title("Retriever")
 cfg        = retr.load_retriever_config()
 units_cfg  = cfg.get("units",         retr.DEFAULT_CONFIG["units"])
 rerank_cfg = cfg.get("reranker",      retr.DEFAULT_CONFIG["reranker"])
+extract_cfg = cfg.get("extractor",    retr.DEFAULT_CONFIG["extractor"])
 preproc_cfg = cfg.get("preprocessing", retr.DEFAULT_CONFIG["preprocessing"])
 
 # ── 선택지 ────────────────────────────────────────────────────────
@@ -43,6 +44,11 @@ RERANKER_MODELS = {
 }
 
 QT_METHODS = ["없음", "HyDE", "Multi-Query", "Decomposition"]
+
+EXTRACTOR_MODELS = {
+    "GPT-4o mini (빠름/저렴)": "gpt-4o-mini",
+    "GPT-4o (정확)": "gpt-4o",
+}
 
 QT_DESCRIPTIONS = {
     "없음":         "원본 질문 그대로 사용합니다.",
@@ -287,12 +293,58 @@ new_rerank = {
     "final_k": r_final_k,
 }
 
+st.markdown("---")
+
+# ════════════════════════════════════════════════════════════════
+# 섹션 3: LLM-Extractor
+# ════════════════════════════════════════════════════════════════
+st.markdown("### LLM-Extractor")
+st.caption("리랭커 이후 단계에서 LLM이 각 문서의 질문 관련 핵심 내용만 추출합니다. 컨텍스트 노이즈를 줄여 답변 품질을 높이지만, LLM 호출 비용이 추가됩니다.")
+
+e_enabled   = extract_cfg.get("enabled", False)
+e_model_val = extract_cfg.get("model", "gpt-4o-mini")
+
+ext_model_labels = list(EXTRACTOR_MODELS.keys())
+ext_model_values = list(EXTRACTOR_MODELS.values())
+ext_model_idx    = ext_model_values.index(e_model_val) if e_model_val in ext_model_values else 0
+
+with st.container(border=True):
+    ec1, ec2 = st.columns([1, 3])
+    with ec1:
+        e_enabled = st.toggle(
+            "사용",
+            value=e_enabled,
+            key="e_enabled",
+            help="리랭커로 순위 재조정 후, LLM이 각 문서에서 질문과 관련된 내용만 추출합니다.",
+        )
+    with ec2:
+        e_model_label = st.selectbox(
+            "추출 모델",
+            options=ext_model_labels,
+            index=ext_model_idx,
+            disabled=not e_enabled,
+            key="e_model",
+            help="문서에서 핵심을 뽑아낼 LLM 모델을 선택하세요. gpt-4o-mini로도 충분히 정확합니다.",
+        )
+
+    if e_enabled:
+        st.info(
+            "💡 **파이프라인 순서**: 검색 → 리랭커(순위 재조정) → LLM-Extractor(핵심 추출) → 최종 답변 생성",
+            icon=None,
+        )
+
+new_extract = {
+    "enabled": e_enabled,
+    "model":   EXTRACTOR_MODELS.get(e_model_label, e_model_val) if e_enabled else e_model_val,
+}
+
 # ── 저장 ─────────────────────────────────────────────────────────
 new_cfg = {
     "alias":         "combined_search",
     "preprocessing": new_preproc,
     "units":         new_units,
     "reranker":      new_rerank,
+    "extractor":     new_extract,
 }
 
 if st.button("저장", type="primary", use_container_width=True):

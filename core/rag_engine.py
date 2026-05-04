@@ -26,14 +26,16 @@ from . import vector_db
 from . import retrievers as retr
 from . import prompts as prompt_store
 
-LLM_MODEL = "gpt-4o-mini"
+# LLM_MODEL 전역 상수는 제거하고 retr.get_global_model()을 사용합니다.
 
 
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
-def _llm(temperature: float = 0.2) -> ChatOpenAI:
-    return ChatOpenAI(model=LLM_MODEL, temperature=temperature)
+def _llm(temperature: float = 0.2, model: str | None = None) -> ChatOpenAI:
+    if not model:
+        model = retr.get_global_model()
+    return ChatOpenAI(model=model, temperature=temperature, max_retries=3, request_timeout=60)
 
 
 def _extract_json(text: str) -> Any:
@@ -80,9 +82,10 @@ DEFAULT_SELF_QUERY_PROMPT = """\
 - user_income_annual: 연봉/연소득 (만원, int). 없으면 null.
   ※ 월소득만 있으면 ×12 해서 annual도 채우세요.
 - user_income_pct: 중위소득 % 언급 시 (int). 없으면 null.
-- user_household: 가구형태. "1인가구"|"신혼부부"|"한부모가족"|"청년" 중 하나, 없으면 null.
-- user_housing: 희망 주거형태. "전세"|"월세"|"매입"|"임대주택" 중 하나, 없으면 null.
-- user_district: 언급된 서울 자치구명 (예: "강남구"). 없으면 null.
+- user_marital_status: 혼인 상태. "미혼"|"기혼"|"신혼부부" 중 하나, 없으면 null.
+- user_housing_type: 희망 주거/지원 형태. "전세"|"월세"|"임대주택"|"이사비" 중 하나, 없으면 null.
+- user_region: 언급된 서울 자치구명 (예: "도봉구", "강남구"). 없으면 null.
+- user_is_homeless: 무주택자 여부 언급 시 (bool). 언급 없으면 null.
 
 [사용자 질문]
 {question}
@@ -93,9 +96,10 @@ DEFAULT_SELF_QUERY_PROMPT = """\
   "user_income_monthly": null,
   "user_income_annual": null,
   "user_income_pct": null,
-  "user_household": null,
-  "user_housing": null,
-  "user_district": null
+  "user_marital_status": null,
+  "user_housing_type": null,
+  "user_region": null,
+  "user_is_homeless": null
 }}
 """
 
@@ -140,10 +144,11 @@ DEFAULT_DECOMPOSITION_PROMPT = """\
 def apply_self_query(
     question: str,
     prompt: str | None = None,
+    model: str | None = None,
 ) -> Optional[Dict[str, Any]]:
     """사용자 질문 → Chroma where 필터 dict (적용 가능한 조건 없으면 None)."""
     template = prompt or DEFAULT_SELF_QUERY_PROMPT
-    chain = ChatPromptTemplate.from_template(template) | _llm(0.0) | StrOutputParser()
+    chain = ChatPromptTemplate.from_template(template) | _llm(0.0, model=model) | StrOutputParser()
     raw = chain.invoke({"question": question})
     parsed = _extract_json(raw)
     if not isinstance(parsed, dict):
@@ -151,46 +156,55 @@ def apply_self_query(
 
     conditions: List[Dict] = []
 
+    # 1. 연령
     age = parsed.get("user_age")
     if isinstance(age, (int, float)) and age > 0:
         a = int(age)
         conditions.append({"age_min": {"$lte": a}})
         conditions.append({"age_max": {"$gte": a}})
 
-    # 연소득 (monthly × 12 우선, 없으면 annual 직접)
+    # 2. 소득 (income_max_man)
     income_annual = parsed.get("user_income_annual")
     if income_annual is None and parsed.get("user_income_monthly"):
         m = parsed.get("user_income_monthly")
         if isinstance(m, (int, float)) and m > 0:
             income_annual = int(m) * 12
+    
     if isinstance(income_annual, (int, float)) and income_annual > 0:
-        # income_max=0 이면 "제한 없음" 정책이므로 필터에서 제외하면 놓칠 수 있음
-        # → income_max >= annual OR income_max == 0 은 Chroma에서 $or 로 처리
+        # DB의 income_max_man 필드와 비교 (단위: 만원)
+        # ChromaDB는 None 값을 where 조건에 사용할 수 없으므로 $gte만 사용
         conditions.append({"$or": [
-            {"income_max": {"$eq": 0}},
-            {"income_max": {"$gte": int(income_annual)}},
+            {"income_max_man": {"$eq": 0}},
+            {"income_max_man": {"$gte": int(income_annual)}},
         ]})
 
-    income_pct = parsed.get("user_income_pct")
-    if isinstance(income_pct, (int, float)) and income_pct > 0:
-        conditions.append({"$or": [
-            {"income_pct": {"$eq": 0}},
-            {"income_pct": {"$gte": int(income_pct)}},
-        ]})
+    # 3. 혼인 상태 (marital_status)
+    marital = parsed.get("user_marital_status")
+    if marital and isinstance(marital, str):
+        conditions.append({"marital_status": {"$in": [marital, "무관"]}})
 
-    household = parsed.get("user_household")
-    if household and isinstance(household, str):
-        conditions.append({"household_type": {"$in": [household, "무관"]}})
-
-    housing = parsed.get("user_housing")
+    # 4. 주거/지원 형태 (housing_type)
+    housing = parsed.get("user_housing_type")
     if housing and isinstance(housing, str):
-        conditions.append({"housing_type": {"$in": [housing, "무관"]}})
-
-    district = parsed.get("user_district")
-    if district and isinstance(district, str):
         conditions.append({"$or": [
-            {"district": {"$eq": district}},
-            {"district": {"$eq": "서울특별시"}},
+            {"housing_type": {"$contains": housing}},
+            {"loan_type": {"$contains": housing}},
+            {"tags": {"$contains": housing}}
+        ]})
+
+    # 5. 지역 (region)
+    region = parsed.get("user_region")
+    if region and isinstance(region, str):
+        # "도봉구" -> "서울 도봉구" 처럼 부분 매칭 지원을 위해 $contains 사용 권장하나 
+        # Chroma 버전에 따라 다를 수 있음. 여기서는 일단 유연하게 처리.
+        conditions.append({"region": {"$contains": region}})
+
+    # 6. 무주택 여부
+    homeless = parsed.get("user_is_homeless")
+    if homeless is True:
+        conditions.append({"$or": [
+            {"is_homeless": {"$eq": True}},
+            {"requires_no_house": {"$eq": True}}
         ]})
 
     if not conditions:
@@ -206,10 +220,11 @@ def apply_self_query(
 def apply_hyde(
     question: str,
     prompt: str | None = None,
+    model: str | None = None,
 ) -> str:
     """질문 → 가상 정책 문서 텍스트 (검색 쿼리 대체용)."""
     template = prompt or DEFAULT_HYDE_PROMPT
-    chain = ChatPromptTemplate.from_template(template) | _llm(0.3) | StrOutputParser()
+    chain = ChatPromptTemplate.from_template(template) | _llm(0.3, model=model) | StrOutputParser()
     result = chain.invoke({"question": question})
     return result.strip() or question
 
@@ -220,10 +235,11 @@ def apply_hyde(
 def apply_multi_query(
     question: str,
     prompt: str | None = None,
+    model: str | None = None,
 ) -> List[str]:
     """원본 질문 + LLM 생성 3개 질의 = 총 4개 반환."""
     template = prompt or DEFAULT_MULTI_QUERY_PROMPT
-    chain = ChatPromptTemplate.from_template(template) | _llm(0.3) | StrOutputParser()
+    chain = ChatPromptTemplate.from_template(template) | _llm(0.3, model=model) | StrOutputParser()
     raw = chain.invoke({"question": question})
     parsed = _extract_json(raw)
     variants: List[str] = []
@@ -238,10 +254,11 @@ def apply_multi_query(
 def apply_decomposition(
     question: str,
     prompt: str | None = None,
+    model: str | None = None,
 ) -> List[str]:
     """복잡한 질문 → 하위 질문 리스트."""
     template = prompt or DEFAULT_DECOMPOSITION_PROMPT
-    chain = ChatPromptTemplate.from_template(template) | _llm(0.0) | StrOutputParser()
+    chain = ChatPromptTemplate.from_template(template) | _llm(0.0, model=model) | StrOutputParser()
     raw = chain.invoke({"question": question})
     parsed = _extract_json(raw)
     subs: List[str] = []
@@ -256,6 +273,7 @@ def apply_decomposition(
 def apply_preprocessing(
     question: str,
     preproc_cfg: Dict[str, Any],
+    model: str | None = None,
 ) -> Dict[str, Any]:
     """전처리 설정에 따라 queries 리스트 + metadata_filter 반환.
 
@@ -271,12 +289,12 @@ def apply_preprocessing(
     prompts_map = qt_cfg.get("prompts", {})
 
     if method == "HyDE":
-        hyde_text = apply_hyde(question, prompts_map.get("HyDE"))
+        hyde_text = apply_hyde(question, prompts_map.get("HyDE"), model=model)
         queries = [hyde_text]
     elif method == "Multi-Query":
-        queries = apply_multi_query(question, prompts_map.get("Multi-Query"))
+        queries = apply_multi_query(question, prompts_map.get("Multi-Query"), model=model)
     elif method == "Decomposition":
-        queries = apply_decomposition(question, prompts_map.get("Decomposition"))
+        queries = apply_decomposition(question, prompts_map.get("Decomposition"), model=model)
     else:  # "없음"
         queries = [question]
 
@@ -284,7 +302,7 @@ def apply_preprocessing(
     metadata_filter = None
     sq_cfg = preproc_cfg.get("self_query", {})
     if sq_cfg.get("enabled"):
-        metadata_filter = apply_self_query(question, sq_cfg.get("prompt"))
+        metadata_filter = apply_self_query(question, sq_cfg.get("prompt"), model=model)
 
     return {"queries": queries, "metadata_filter": metadata_filter}
 
@@ -296,10 +314,11 @@ def ask_or_ready(
     question: str,
     ask_prompt: str | None = None,
     temperature: float = 0.0,
+    model: str | None = None,
 ) -> Dict[str, Any]:
     """결과: {status: 'ASK'|'READY', missing: [...], question: '...'}"""
     template = ask_prompt or prompt_store.load_prompts()["ask"]
-    chain = ChatPromptTemplate.from_template(template) | _llm(temperature) | StrOutputParser()
+    chain = ChatPromptTemplate.from_template(template) | _llm(temperature, model=model) | StrOutputParser()
     raw = chain.invoke({"question": question})
     parsed = _extract_json(raw)
     if not isinstance(parsed, dict):
@@ -330,8 +349,8 @@ DECOMPOSE_PROMPT = """\
 """
 
 
-def decompose_question(question: str) -> Tuple[str, str]:
-    chain = ChatPromptTemplate.from_template(DECOMPOSE_PROMPT) | _llm(0.0) | StrOutputParser()
+def decompose_question(question: str, model: str | None = None) -> Tuple[str, str]:
+    chain = ChatPromptTemplate.from_template(DECOMPOSE_PROMPT) | _llm(0.0, model=model) | StrOutputParser()
     raw = chain.invoke({"question": question})
     parsed = _extract_json(raw) or {}
     return (
@@ -381,10 +400,11 @@ def select_top3(
     finance_docs: List[Document],
     selection_prompt: str | None = None,
     temperature: float = 0.0,
+    model: str | None = None,
 ) -> List[Dict[str, Any]]:
     template = selection_prompt or prompt_store.load_prompts()["selection"]
     contexts = _format_docs(housing_docs + finance_docs) or "(컨텍스트 없음)"
-    chain = ChatPromptTemplate.from_template(template) | _llm(temperature) | StrOutputParser()
+    chain = ChatPromptTemplate.from_template(template) | _llm(temperature, model=model) | StrOutputParser()
     raw = chain.invoke({"question": question, "contexts": contexts})
     parsed = _extract_json(raw)
 
@@ -427,9 +447,10 @@ def make_report(
     contexts: List[str] | None = None,
     report_prompt: str | None = None,
     temperature: float = 0.3,
+    model: str | None = None,
 ) -> str:
     template = report_prompt or prompt_store.load_prompts()["report"]
-    chain = ChatPromptTemplate.from_template(template) | _llm(temperature) | StrOutputParser()
+    chain = ChatPromptTemplate.from_template(template) | _llm(temperature, model=model) | StrOutputParser()
     contexts_str = "\n---\n".join(contexts) if contexts else "(컨텍스트 없음)"
     return chain.invoke({
         "question": question,
@@ -446,6 +467,7 @@ def stream_report(
     top3: List[Dict[str, Any]],
     contexts: List[str] | None = None,
     prompts_dict: Dict[str, Any] | None = None,
+    model: str | None = None,
 ):
     """Report LLM 출력을 chunk 단위로 yield하는 제너레이터."""
     from langchain_openai import ChatOpenAI as _ChatOpenAI
@@ -453,7 +475,10 @@ def stream_report(
     template     = prompts_dict.get("report") or prompt_store.load_prompts()["report"]
     temperature  = float(prompts_dict.get("report_temp", 0.3))
 
-    llm  = _ChatOpenAI(model=LLM_MODEL, temperature=temperature, streaming=True)
+    if not model:
+        model = retr.get_global_model()
+
+    llm  = _ChatOpenAI(model=model, temperature=temperature, streaming=True)
     chain = ChatPromptTemplate.from_template(template) | llm | StrOutputParser()
     contexts_str = "\n---\n".join(contexts) if contexts else "(컨텍스트 없음)"
 
@@ -471,6 +496,7 @@ def run_pipeline_top3(
     question: str,
     retriever_config: Dict[str, Any],
     prompts_dict: Dict[str, Any] | None = None,
+    model: str | None = None,
 ) -> Dict[str, Any]:
     """전처리 → 질문 분해 → 검색 → Top3 선정.
 
@@ -481,7 +507,7 @@ def run_pipeline_top3(
     preproc_cfg  = retriever_config.get("preprocessing", {})
 
     # ── 0. 전처리 ──────────────────────────────────────────────────
-    preproc_result  = apply_preprocessing(question, preproc_cfg)
+    preproc_result  = apply_preprocessing(question, preproc_cfg, model=model)
     queries         = preproc_result["queries"]          # 1~4개
     metadata_filter = preproc_result["metadata_filter"]  # Chroma where or None
 
@@ -492,7 +518,7 @@ def run_pipeline_top3(
     finance_queries: List[str] = []
 
     for q in queries:
-        hq, fq = decompose_question(q)
+        hq, fq = decompose_question(q, model=model)
         housing_queries.append(hq)
         finance_queries.append(fq)
         h_docs, f_docs = retrieve_candidates(hq, fq, retriever_config, metadata_filter)
@@ -510,6 +536,7 @@ def run_pipeline_top3(
         all_finance_docs,
         selection_prompt=prompts_dict.get("selection"),
         temperature=float(prompts_dict.get("selection_temp", 0.0)),
+        model=model,
     )
 
     return {
@@ -532,6 +559,7 @@ def run_pipeline_report(
     top3: List[Dict[str, Any]],
     contexts: List[str] | None = None,
     prompts_dict: Dict[str, Any] | None = None,
+    model: str | None = None,
 ) -> str:
     prompts_dict = prompts_dict or prompt_store.load_prompts()
     return make_report(
@@ -540,6 +568,7 @@ def run_pipeline_report(
         contexts=contexts,
         report_prompt=prompts_dict.get("report"),
         temperature=float(prompts_dict.get("report_temp", 0.3)),
+        model=model,
     )
 
 
@@ -550,12 +579,13 @@ def run_pipeline(
     question: str,
     retriever_config: Dict[str, Any],
     prompts_dict: Dict[str, str] | None = None,
+    model: str | None = None,
 ) -> Dict[str, Any]:
     """6-A + 6-B 를 순서대로 실행하는 wrapper."""
     prompts_dict = prompts_dict or prompt_store.load_prompts()
 
-    stage1 = run_pipeline_top3(question, retriever_config, prompts_dict)
-    report = run_pipeline_report(question, stage1["top3"], stage1["contexts_text"], prompts_dict)
+    stage1 = run_pipeline_top3(question, retriever_config, prompts_dict, model=model)
+    report = run_pipeline_report(question, stage1["top3"], stage1["contexts_text"], prompts_dict, model=model)
 
     housing_docs = stage1["housing_docs"]
     finance_docs = stage1["finance_docs"]
