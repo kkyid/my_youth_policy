@@ -34,6 +34,7 @@ UNIT_TYPES = [
     "BM25",
     "Multi-Query Retriever",
     "Parent Document Retriever",
+    "Collapsed RAPTOR",
     "Self-Querying Retriever",
 ]
 SEARCH_TYPES = ["similarity", "mmr", "similarity_score_threshold"]
@@ -186,6 +187,7 @@ for i in range(3):
             )
             is_active = u_type != "미설정"
             is_bm25   = u_type == "BM25"
+            is_raptor = u_type == "Collapsed RAPTOR"
 
             u_k = st.slider(
                 "검색 후보 수 (k)",
@@ -202,6 +204,13 @@ for i in range(3):
                     "검색 방식", options=["해당 없음 (BM25)"],
                     disabled=True, key=f"u_search_{i}",
                     help="BM25는 키워드 기반이라 검색 방식 설정이 필요 없어요.",
+                )
+            elif is_raptor:
+                u_search = "similarity"
+                st.selectbox(
+                    "검색 방식", options=["Collapsed Tree (leaf + summary)"],
+                    disabled=True, key=f"u_search_{i}",
+                    help="기존 bge-m3 RAPTOR DB에서 leaf node와 summary node를 함께 검색합니다.",
                 )
             else:
                 saved_stype = u_cfg.get("search_type", "similarity")
@@ -232,6 +241,16 @@ for i in range(3):
                     help="이 점수 미만의 문서는 결과에서 제외돼요.",
                 )
 
+            u_summary_k = int(u_cfg.get("summary_k", max(1, u_k // 3)))
+            if is_active and is_raptor:
+                u_summary_k = st.slider(
+                    "Summary node 수",
+                    0, u_k, min(u_summary_k, u_k), 1,
+                    key=f"u_summary_k_{i}",
+                    help="전체 k 중 level=1 요약 노드를 몇 개 섞을지 정합니다. 나머지는 level=0 원문 청크입니다.",
+                )
+                st.caption(f"Leaf node {u_k - u_summary_k}개 + Summary node {u_summary_k}개")
+
             u_weight = float(u_cfg.get("weight", 1.0))
             if is_active and n_active > 1:
                 u_weight = st.slider(
@@ -249,6 +268,8 @@ for i in range(3):
                 "weight":          u_weight if is_active else 1.0,
                 "lambda_mult":     u_lambda,
                 "score_threshold": u_thresh,
+                "leaf_k":          max(0, u_k - u_summary_k) if is_raptor else u_cfg.get("leaf_k", 0),
+                "summary_k":       u_summary_k if is_raptor else u_cfg.get("summary_k", 0),
             })
 
 st.markdown("---")

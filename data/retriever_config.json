@@ -2,11 +2,11 @@
   "alias": "combined_search",
   "preprocessing": {
     "self_query": {
-      "enabled": false,
-      "prompt": ""
+      "enabled": true,
+      "prompt": "사용자 질문에서 정책 DB 필터 조건을 추출하세요.\n\n[추출 규칙]\n- user_age: 언급된 나이 (int). 없으면 null.\n- user_income_monthly: 월소득/월급 (만원, int). 없으면 null.\n- user_income_annual: 연봉/연소득 (만원, int). 없으면 null.\n  ※ 월소득만 있으면 ×12 해서 annual도 채우세요.\n- user_income_pct: 중위소득 % 언급 시 (int). 없으면 null.\n- user_marital_status: 혼인 상태. \"미혼\"|\"기혼\"|\"신혼부부\" 중 하나, 없으면 null.\n- user_housing_type: 희망 주거/지원 형태. \"전세\"|\"월세\"|\"임대주택\"|\"이사비\" 중 하나, 없으면 null.\n- user_region: 언급된 서울 자치구명 (예: \"도봉구\", \"강남구\"). 없으면 null.\n- user_is_homeless: 무주택자 여부 언급 시 (bool). 언급 없으면 null.\n\n[사용자 질문]\n{question}\n\n[출력 - JSON만]\n{{\n  \"user_age\": null,\n  \"user_income_monthly\": null,\n  \"user_income_annual\": null,\n  \"user_income_pct\": null,\n  \"user_marital_status\": null,\n  \"user_housing_type\": null,\n  \"user_region\": null,\n  \"user_is_homeless\": null\n}}\n"
     },
     "query_transform": {
-      "method": "없음",
+      "method": "Multi-Query",
       "prompts": {
         "HyDE": "아래 사용자 질문에 대한 답이 될 만한 가상의 정책 문서 단락을 작성하세요.\n서울시 청년/신혼부부 주택·금융 정책 형식을 따르세요.\n실제로 존재하는 것처럼 구체적으로 작성하되, 300자 이내로 작성하세요.\n\n[사용자 질문]\n{question}\n\n[가상 정책 문서]\n",
         "Multi-Query": "아래 사용자 질문을 검색 관점이 다른 3가지 질의로 재작성하세요.\n서울시 청년/신혼부부 주택·금융 정책 DB 검색에 최적화하세요.\n원본 질문과 겹치지 않도록 다양한 표현·키워드를 활용하세요.\n\n[원본 질문]\n{question}\n\n[출력 - JSON 배열, 정확히 3개]\n[\"질의1\", \"질의2\", \"질의3\"]\n",
@@ -16,22 +16,26 @@
   },
   "units": [
     {
-      "type": "VectorStore",
-      "k": 7,
-      "search_type": "mmr",
+      "type": "Collapsed RAPTOR",
+      "k": 6,
+      "search_type": "similarity",
       "active": true,
-      "weight": 0.4,
+      "weight": 0.5,
       "lambda_mult": 0.5,
-      "score_threshold": 0.5
+      "score_threshold": 0.5,
+      "leaf_k": 4,
+      "summary_k": 2
     },
     {
       "type": "BM25",
       "k": 7,
       "search_type": "similarity",
       "active": true,
-      "weight": 0.6,
+      "weight": 0.5,
       "lambda_mult": 0.5,
-      "score_threshold": 0.5
+      "score_threshold": 0.5,
+      "leaf_k": 0,
+      "summary_k": 0
     },
     {
       "type": "미설정",
@@ -40,11 +44,13 @@
       "active": false,
       "weight": 1.0,
       "lambda_mult": 0.5,
-      "score_threshold": 0.5
+      "score_threshold": 0.5,
+      "leaf_k": 0,
+      "summary_k": 0
     }
   ],
   "reranker": {
-    "enabled": false,
+    "enabled": true,
     "type": "Cross-Encoder",
     "model": "bongsoo/kpf-cross-encoder-v1",
     "final_k": 6

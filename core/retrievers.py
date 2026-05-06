@@ -23,6 +23,8 @@ from langchain.chains.query_constructor.base import AttributeInfo
 from pydantic import Field
 import streamlit as st
 
+from . import vector_db
+
 
 # ── 한국어 토크나이저 ────────────────────────────────────────────
 @st.cache_resource
@@ -181,10 +183,73 @@ class CustomParentDocumentRetriever(BaseRetriever):
         return parent_docs
 
 
+class CollapsedRaptorRetriever(BaseRetriever):
+    """Collapsed Tree RAPTOR 검색기.
+
+    기존 RAPTOR DB는 level=0 leaf node와 level=1 summary node가 같은
+    컬렉션에 함께 저장되어 있으므로, 두 레벨을 나눠 검색한 뒤 합쳐 반환한다.
+    """
+
+    vectorstore: Any = Field(description="bge-m3 기반 RAPTOR Chroma vectorstore")
+    leaf_k: int = Field(default=4)
+    summary_k: int = Field(default=2)
+
+    def _normalize_doc(self, doc: Document) -> Document:
+        meta = dict(doc.metadata or {})
+        original_category = meta.get("category", "")
+        level = meta.get("level", "")
+
+        meta["raptor_level"] = level
+        meta["raptor_category"] = original_category
+        meta["category"] = "주택"
+        meta["title"] = meta.get("policy_name") or meta.get("title") or ""
+        meta["source"] = meta.get("source_file") or meta.get("source") or ""
+        meta["doc_id"] = meta.get("policy_id") or meta.get("doc_id") or ""
+        meta["summary"] = meta.get("summary") or ""
+
+        return Document(page_content=doc.page_content, metadata=meta)
+
+    def _search_level(self, query: str, level: int, k: int) -> List[Document]:
+        if k <= 0:
+            return []
+        try:
+            return self.vectorstore.similarity_search(query, k=k, filter={"level": {"$eq": level}})
+        except Exception:
+            return []
+
+    def _get_relevant_documents(self, query: str, *, run_manager=None) -> List[Document]:
+        leaf_docs = self._search_level(query, 0, self.leaf_k)
+        summary_docs = self._search_level(query, 1, self.summary_k)
+        docs = leaf_docs + summary_docs
+
+        if not docs:
+            docs = self.vectorstore.similarity_search(query, k=max(1, self.leaf_k + self.summary_k))
+
+        seen: set[str] = set()
+        result: List[Document] = []
+        for doc in docs:
+            meta = doc.metadata or {}
+            key = str(meta.get("policy_id") or meta.get("source_file") or doc.page_content[:80])
+            key = f"{key}:{meta.get('level', '')}:{doc.page_content[:40]}"
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(self._normalize_doc(doc))
+        return result
+
+
+class EmptyRetriever(BaseRetriever):
+    """Return no documents for intentionally unsupported retriever/collection pairs."""
+
+    def _get_relevant_documents(self, query: str, *, run_manager=None) -> List[Document]:
+        return []
+
+
 # ── 메인 빌더 ─────────────────────────────────────────────────────
 def build_retriever(vectorstore: Chroma, config: Dict[str, Any], metadata_filter: Dict[str, Any] | None = None) -> BaseRetriever:
     """설정에 따라 리트리버를 조립해 반환."""
     cfg = config or load_retriever_config()
+    current_collection = getattr(getattr(vectorstore, "_collection", None), "name", None)
 
     active_retrievers: list = []
     weights: list = []
@@ -245,6 +310,16 @@ def build_retriever(vectorstore: Chroma, config: Dict[str, Any], metadata_filter
         elif utype == "Parent Document Retriever":
             retriever = CustomParentDocumentRetriever(vectorstore=vectorstore, k=k)
 
+        elif utype == "Collapsed RAPTOR":
+            if current_collection == vector_db.HOUSING_COLLECTION:
+                summary_k = int(unit.get("summary_k", max(1, k // 3)))
+                leaf_k = int(unit.get("leaf_k", max(1, k - summary_k)))
+                retriever = CollapsedRaptorRetriever(
+                    vectorstore=vector_db.get_cached_raptor_vectorstore(),
+                    leaf_k=leaf_k,
+                    summary_k=summary_k,
+                )
+
         elif utype == "Self-Querying Retriever":
             metadata_field_info = [
                 AttributeInfo(name="title",             description="정책/상품명",                               type="string"),
@@ -301,6 +376,13 @@ def build_retriever(vectorstore: Chroma, config: Dict[str, Any], metadata_filter
 
     # fallback
     if not active_retrievers:
+        active_types = [
+            u.get("type")
+            for u in cfg.get("units", DEFAULT_CONFIG["units"])
+            if u.get("active") and u.get("type") not in (None, "", "미설정")
+        ]
+        if active_types and all(t == "Collapsed RAPTOR" for t in active_types):
+            return EmptyRetriever()
         return vectorstore.as_retriever(search_kwargs={"k": 3})
 
     # 1단계: 병렬 앙상블 (유닛별 가중치 적용)
