@@ -37,6 +37,18 @@ st.markdown("""
 .log-table th.col-sc { text-align:center; }
 .log-table .col-rt { width:140px; min-width:140px; }
 .log-table .col-dt { width:100px; min-width:100px; color:#94A3B8; font-size:0.8rem; white-space:nowrap; }
+.log-table .col-cnt { width:70px; min-width:70px; text-align:center; font-size:0.9rem; font-weight:600; color:#475569; }
+.log-table th.col-cnt { text-align:center; }
+.log-table .col-total { width:70px; max-width:70px; text-align:center; font-size:1rem; font-weight:700; }
+.log-table th.col-total { text-align:center; }
+.score-badge {
+    display:inline-block; border-radius:6px; padding:2px 8px;
+    font-size:0.9rem; font-weight:700; font-variant-numeric:tabular-nums;
+}
+.score-hi  { background:#DCFCE7; color:#15803D; }
+.score-mid { background:#FEF9C3; color:#A16207; }
+.score-lo  { background:#FEE2E2; color:#B91C1C; }
+.score-na  { background:#F1F5F9; color:#94A3B8; }
 .log-table .retr-badge {
     display:inline-block; background:#F1F5F9; border:1px solid #CBD5E1;
     border-radius:5px; padding:2px 8px; margin-bottom:3px;
@@ -262,8 +274,8 @@ with tab1:
     header = (
         "<thead><tr>"
         "<th class='col-tag'>태그</th>"
-        "<th class='col-q'>질문</th>"
-        "<th class='col-gt'>테스트셋 답변</th>"
+        "<th class='col-q'>테스트용 질문</th>"
+        "<th class='col-gt'>테스트용 답변</th>"
         "<th class='col-sc'>Faithful</th>"
         "<th class='col-sc'>Ans Rel</th>"
         "<th class='col-sc'>Ctx Prec</th>"
@@ -370,13 +382,6 @@ with tab2:
         if not selected_tags:
             st.warning("비교할 태그를 1개 이상 선택하세요.")
         else:
-            from collections import defaultdict
-            tag_records_map = defaultdict(list)
-            for r in eval_records:
-                tag = r.get("tag") or "태그없음"
-                if tag in selected_tags:
-                    tag_records_map[tag].append(r)
-
             # 태그별 집계
             tag_records_map = defaultdict(list)
             for r in eval_records:
@@ -384,44 +389,51 @@ with tab2:
                 if tag in selected_tags:
                     tag_records_map[tag].append(r)
 
+            def _score_badge(val) -> str:
+                try:
+                    v = float(val)
+                    cls = "score-hi" if v >= 0.7 else ("score-mid" if v >= 0.4 else "score-lo")
+                    return f"<span class='score-badge {cls}'>{v:.3f}</span>"
+                except Exception:
+                    return "<span class='score-badge score-na'>—</span>"
+
             cmp_header = (
                 "<thead><tr>"
                 "<th class='col-tag'>태그</th>"
-                "<th class='col-dt'>실험 수</th>"
+                "<th class='col-cnt'>실험 수</th>"
                 "<th class='col-sc'>Faithful</th>"
                 "<th class='col-sc'>Ans Rel</th>"
                 "<th class='col-sc'>Ctx Prec</th>"
                 "<th class='col-sc'>Ctx Rec</th>"
-                "<th class='col-id'>종합</th>"
+                "<th class='col-total'>종합</th>"
                 "<th class='col-rt'>리트리버</th>"
-                
                 "</tr></thead>"
             )
-            
+
             cmp_rows_html = ""
             for tag in selected_tags:
-                grp = tag_records_map[tag]
+                grp = tag_records_map.get(tag, [])
                 if not grp:
                     continue
-                
+
                 # 평균 메트릭 계산
                 metric_avgs = {}
                 for k in METRIC_COLS:
                     vals = [r["metrics"][k] for r in grp if r.get("metrics") and r["metrics"].get(k) is not None]
-                    metric_avgs[k] = sum(vals) / len(vals) if vals else 0.0
-                    
-                m_vals = list(metric_avgs.values())
-                total_score = sum(m_vals) / len(m_vals) if m_vals else 0.0
-                
+                    metric_avgs[k] = sum(vals) / len(vals) if vals else None
+
+                m_vals = [v for v in metric_avgs.values() if v is not None]
+                total_score = sum(m_vals) / len(m_vals) if m_vals else None
+
                 cmp_rows_html += (
                     "<tr>"
                     f"<td class='col-tag'><b>{tag}</b></td>"
-                    f"<td class='col-dt'>{len(grp)}건</td>"
-                    f"<td class='col-sc'>{_score(metric_avgs['faithfulness'])}</td>"
-                    f"<td class='col-sc'>{_score(metric_avgs['answer_relevance'])}</td>"
-                    f"<td class='col-sc'>{_score(metric_avgs['context_precision'])}</td>"
-                    f"<td class='col-sc'>{_score(metric_avgs['context_recall'])}</td>"
-                    f"<td class='col-id' style='color:#4F46E5; font-weight:bold;'>{_score(total_score)}</td>"
+                    f"<td class='col-cnt'>{len(grp)}건</td>"
+                    f"<td class='col-sc'>{_score(metric_avgs.get('faithfulness'))}</td>"
+                    f"<td class='col-sc'>{_score(metric_avgs.get('answer_relevance'))}</td>"
+                    f"<td class='col-sc'>{_score(metric_avgs.get('context_precision'))}</td>"
+                    f"<td class='col-sc'>{_score(metric_avgs.get('context_recall'))}</td>"
+                    f"<td class='col-total'>{_score_badge(total_score)}</td>"
                     f"<td class='col-rt'>{fmt_retrievers_html(grp[0].get('retriever'))}</td>"
                     "</tr>"
                 )

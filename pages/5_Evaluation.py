@@ -21,6 +21,20 @@ from core.ui import inject_ui, render_page_title
 from core import rag_engine, evaluator, retrievers as retr, prompts as prompt_store
 from core import logger as exp_logger
 
+# ── LangSmith 클라이언트 (없으면 None) ────────────────────────────
+try:
+    from langsmith import Client as _LSClient
+    from langsmith.run_helpers import get_current_run_tree as _get_rt, traceable as _ls_traceable
+    _ls_client = _LSClient()
+    _LANGSMITH_ENABLED = True
+except Exception:
+    _ls_client = None
+    _LANGSMITH_ENABLED = False
+    def _ls_traceable(**kw):  # type: ignore
+        def _d(fn): return fn
+        return _d
+    def _get_rt(): return None  # type: ignore
+
 inject_ui()
 render_page_title("Evaluation")
 
@@ -233,27 +247,44 @@ if run_eval:
     results      = []
     progress     = st.progress(0.0, text="평가 진행 중...")
 
+    @_ls_traceable(name="evaluation_case", run_type="chain")
+    def _run_and_score(q: str, gt: str) -> dict:
+        """파이프라인 실행 + RAGAS 채점 + LangSmith Feedback 전송."""
+        res = rag_engine.run_pipeline(q, cfg, prompts_dict)
+        metrics = evaluator.evaluate_rag(
+            question=q,
+            contexts=res["contexts_text"],
+            answer=res["report"],
+            ground_truth=gt,
+            model=ACTIVE_EVAL_MODEL,
+        )
+        # LangSmith Feedback 전송 (evaluation_case Run에 점수 기록)
+        if _LANGSMITH_ENABLED:
+            try:
+                rt = _get_rt()
+                if rt:
+                    for k in ["faithfulness", "answer_relevance", "context_precision", "context_recall"]:
+                        v = metrics.get(k)
+                        if v is not None:
+                            _ls_client.create_feedback(str(rt.id), key=k, score=float(v))
+            except Exception:
+                pass
+        return {"res": res, "metrics": metrics}
+
     def evaluate_single_case(i, case):
         q  = str(case.get("question", "")).strip()
         gt = str(case.get("ground_truth", "")).strip()
-        
+
         max_retries = 3
         last_error = ""
 
         for attempt in range(1, max_retries + 1):
             try:
-                # 1. RAG 파이프라인 실행
-                res = rag_engine.run_pipeline(q, cfg, prompts_dict)
-                
-                # 2. 메트릭 채점
-                metrics = evaluator.evaluate_rag(
-                    question=q,
-                    contexts=res["contexts_text"],
-                    answer=res["report"],
-                    ground_truth=gt,
-                    model=ACTIVE_EVAL_MODEL,
-                )
-                
+                # 1. RAG 파이프라인 실행 + 채점 (LangSmith 트레이싱 포함)
+                out     = _run_and_score(q, gt)
+                res     = out["res"]
+                metrics = out["metrics"]
+
                 result_data = {
                     "question":     q,
                     "ground_truth": gt,
@@ -262,11 +293,11 @@ if run_eval:
                     **metrics,
                 }
 
-                # 3. Logs 기록
+                # 2. Logs 기록
                 try:
                     exp_logger.log_experiment({
                         "question":      q,
-                        "ground_truth":  gt,  # 정답 데이터 추가
+                        "ground_truth":  gt,
                         "retriever":     cfg,
                         "top3":          res["top3"],
                         "report":        res["report"],
@@ -284,7 +315,7 @@ if run_eval:
             except Exception as e:
                 last_error = str(e)
                 if attempt < max_retries:
-                    time.sleep(attempt * 2)  # 지수 백오프 (2초, 4초...)
+                    time.sleep(attempt * 2)
                     continue
                 else:
                     return {"error": True, "index": i, "question": q, "message": f"질문 #{i} 최종 실패 (3회 시도): {last_error}"}

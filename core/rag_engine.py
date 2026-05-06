@@ -26,6 +26,17 @@ from . import vector_db
 from . import retrievers as retr
 from . import prompts as prompt_store
 
+# ── LangSmith traceable (없으면 no-op 데코레이터로 폴백) ──────────
+try:
+    from langsmith import traceable as _traceable
+except ImportError:
+    try:
+        from langsmith.run_helpers import traceable as _traceable
+    except ImportError:
+        def _traceable(*, name="", run_type="chain", **kw):  # type: ignore
+            def _deco(fn): return fn
+            return _deco
+
 # LLM_MODEL 전역 상수는 제거하고 retr.get_global_model()을 사용합니다.
 
 
@@ -187,9 +198,9 @@ def apply_self_query(
     housing = parsed.get("user_housing_type")
     if housing and isinstance(housing, str):
         conditions.append({"$or": [
-            {"housing_type": {"$contains": housing}},
-            {"loan_type": {"$contains": housing}},
-            {"tags": {"$contains": housing}}
+            {"housing_type": {"$eq": housing}},
+            {"loan_type": {"$eq": housing}},
+            {"tags": {"$eq": housing}}
         ]})
 
     # 5. 지역 (region)
@@ -197,7 +208,7 @@ def apply_self_query(
     if region and isinstance(region, str):
         # "도봉구" -> "서울 도봉구" 처럼 부분 매칭 지원을 위해 $contains 사용 권장하나 
         # Chroma 버전에 따라 다를 수 있음. 여기서는 일단 유연하게 처리.
-        conditions.append({"region": {"$contains": region}})
+        conditions.append({"region": {"$eq": region}})
 
     # 6. 무주택 여부
     homeless = parsed.get("user_is_homeless")
@@ -308,8 +319,91 @@ def apply_preprocessing(
 
 
 # ---------------------------------------------------------------------------
-# 1. Ask LLM (정보 부족 점검)
+# 1. Ask + Decompose (정보 부족 점검 + 질문 분해 — 1회 LLM 호출)
 # ---------------------------------------------------------------------------
+ASK_AND_DECOMPOSE_PROMPT = """\
+당신은 서울시 청년/신혼부부 주택 정책 상담사입니다.
+두 가지 작업을 동시에 수행하세요.
+
+━━━ 작업 1: 정보 충분성 판단 ━━━
+
+[필수 정보 — 검색을 위해 반드시 필요한 3가지]
+1. 연령대 (예: 만 27세, 20대 후반, 신혼부부 등)
+2. 소득 또는 자산 정보 (예: 연봉 4000만원, 무직, 자산 1억 이하 등)
+3. 가구 형태 (1인가구 / 신혼부부 / 자녀 유무)
+
+[정보 인식 규칙]
+1. 연령대: "살", "세", "대", "년생", "나이", "청년", "사회초년생" 등
+2. 소득/자산: "연봉", "소득", "월급", "자산", "재산", "벌어", "수입", "만원", "억", "무직", "학생" 등 구체적 수치 포함 시
+3. 가구 형태: "1인", "혼자", "미혼", "독신", "신혼", "부부", "결혼", "자녀", "아이", "가족" 등
+
+[판단 규칙]
+1. 전체 텍스트에서 정보를 취합하세요 (추가 정보 포함).
+2. 필수 정보 3가지가 모두 확인되면 즉시 status: "READY".
+3. ASK일 때만 빠진 항목 나열.
+
+[응답 양식 - status가 ASK일 때의 question 필드]
+"📋 필수 정보가 필요해요
+아래 항목을 알려주시면 바로 검색해드릴게요:
+• [빠진 항목명]
+
+💡 아래 선택 정보도 함께 알려주시면 더 정확한 정책을 추천해드릴 수 있어요:
+- 지역 (예: 영등포구, 금천구 등)
+- 주거 형태 선호 (전세 / 월세 / 매입 / 임대주택)
+- 자금 상황 (보유 자금, 대출 가능 여부)"
+
+━━━ 작업 2: 검색 쿼리 분해 ━━━
+사용자 질문을 주택 DB와 금융 DB 검색용으로 각각 분리하세요.
+- housing_query: 주택/임대/공급/입주 관련 검색용 질의
+- finance_query: 대출/금융/이자/자금/지원금 관련 검색용 질의
+status가 ASK이면 housing_query와 finance_query는 빈 문자열로.
+
+━━━ 출력 형식 — JSON만 ━━━
+{{
+  "status": "ASK" 또는 "READY",
+  "missing": ["빠진 항목"],
+  "question": "사용자에게 보낼 메시지 (READY면 빈 문자열)",
+  "housing_query": "주택 검색 쿼리 (ASK면 빈 문자열)",
+  "finance_query": "금융 검색 쿼리 (ASK면 빈 문자열)"
+}}
+
+[사용자 질문]
+{question}
+"""
+
+
+def ask_and_decompose(
+    question: str,
+    ask_prompt: str | None = None,
+    temperature: float = 0.0,
+    model: str | None = None,
+) -> Dict[str, Any]:
+    """ask_or_ready + decompose_question을 1회 LLM 호출로 처리.
+
+    반환: {status, missing, question, housing_query, finance_query}
+    """
+    template = ask_prompt or ASK_AND_DECOMPOSE_PROMPT
+    chain = ChatPromptTemplate.from_template(template) | _llm(temperature, model=model) | StrOutputParser()
+    raw = chain.invoke({"question": question})
+    parsed = _extract_json(raw)
+    if not isinstance(parsed, dict):
+        return {
+            "status": "READY", "missing": [], "question": "",
+            "housing_query": question, "finance_query": question,
+        }
+    status = parsed.get("status", "READY")
+    if status not in ("ASK", "READY"):
+        status = "READY"
+    return {
+        "status":        status,
+        "missing":       parsed.get("missing", []) or [],
+        "question":      parsed.get("question", "") or "",
+        "housing_query": parsed.get("housing_query") or question,
+        "finance_query": parsed.get("finance_query") or question,
+    }
+
+
+# 하위 호환용 — Evaluation 페이지 등에서 단독으로 쓸 경우를 위해 유지
 def ask_or_ready(
     question: str,
     ask_prompt: str | None = None,
@@ -317,24 +411,16 @@ def ask_or_ready(
     model: str | None = None,
 ) -> Dict[str, Any]:
     """결과: {status: 'ASK'|'READY', missing: [...], question: '...'}"""
-    template = ask_prompt or prompt_store.load_prompts()["ask"]
-    chain = ChatPromptTemplate.from_template(template) | _llm(temperature, model=model) | StrOutputParser()
-    raw = chain.invoke({"question": question})
-    parsed = _extract_json(raw)
-    if not isinstance(parsed, dict):
-        return {"status": "READY", "missing": [], "question": ""}
-    status = parsed.get("status", "READY")
-    if status not in ("ASK", "READY"):
-        status = "READY"
+    result = ask_and_decompose(question, ask_prompt, temperature, model)
     return {
-        "status": status,
-        "missing": parsed.get("missing", []) or [],
-        "question": parsed.get("question", "") or "",
+        "status":  result["status"],
+        "missing": result["missing"],
+        "question": result["question"],
     }
 
 
 # ---------------------------------------------------------------------------
-# 2. 질문 분해 (주택 vs 금융)
+# 2. 질문 분해 (주택 vs 금융) — 하위 호환용
 # ---------------------------------------------------------------------------
 DECOMPOSE_PROMPT = """\
 사용자 질문을 두 갈래로 분해하세요.
@@ -370,8 +456,8 @@ def retrieve_candidates(
 ) -> Tuple[List[Document], List[Document]]:
     cfg = dict(config or {})
 
-    housing_vs = vector_db.get_vectorstore(vector_db.HOUSING_COLLECTION)
-    finance_vs = vector_db.get_vectorstore(vector_db.FINANCE_COLLECTION)
+    housing_vs = vector_db.get_cached_vectorstore(vector_db.HOUSING_COLLECTION)
+    finance_vs = vector_db.get_cached_vectorstore(vector_db.FINANCE_COLLECTION)
 
     housing_retriever = retr.build_retriever(housing_vs, cfg, metadata_filter=metadata_filter)
     finance_retriever = retr.build_retriever(finance_vs, cfg, metadata_filter=metadata_filter)
@@ -492,16 +578,20 @@ def stream_report(
 # ---------------------------------------------------------------------------
 # 6-A. 전처리 → 분해 → 검색 → Top3 (app.py 단계별 UX용)
 # ---------------------------------------------------------------------------
+@_traceable(name="pipeline_top3", run_type="chain")
 def run_pipeline_top3(
     question: str,
     retriever_config: Dict[str, Any],
     prompts_dict: Dict[str, Any] | None = None,
     model: str | None = None,
+    predecomposed: Dict[str, str] | None = None,
+    pretrieved: Optional[Tuple[List[Document], List[Document]]] = None,
 ) -> Dict[str, Any]:
     """전처리 → 질문 분해 → 검색 → Top3 선정.
 
-    전처리 설정은 retriever_config["preprocessing"] 에서 읽는다.
-    Multi-Query / Decomposition 이면 여러 쿼리 각각 검색 후 병합.
+    predecomposed: ask_and_decompose()에서 미리 얻은 {housing_query, finance_query}.
+    pretrieved:    투기적 검색으로 미리 얻은 (housing_docs, finance_docs).
+                   둘 다 전달되면 분해 + 검색 LLM/IO를 모두 건너뜀.
     """
     prompts_dict = prompts_dict or prompt_store.load_prompts()
     preproc_cfg  = retriever_config.get("preprocessing", {})
@@ -517,11 +607,20 @@ def run_pipeline_top3(
     housing_queries: List[str] = []
     finance_queries: List[str] = []
 
-    for q in queries:
-        hq, fq = decompose_question(q, model=model)
+    for i, q in enumerate(queries):
+        if i == 0 and predecomposed:
+            hq = predecomposed.get("housing_query") or q
+            fq = predecomposed.get("finance_query") or q
+        else:
+            hq, fq = decompose_question(q, model=model)
         housing_queries.append(hq)
         finance_queries.append(fq)
-        h_docs, f_docs = retrieve_candidates(hq, fq, retriever_config, metadata_filter)
+
+        # 첫 번째 쿼리는 투기적 검색 결과 재사용 (있을 경우)
+        if i == 0 and pretrieved is not None:
+            h_docs, f_docs = pretrieved
+        else:
+            h_docs, f_docs = retrieve_candidates(hq, fq, retriever_config, metadata_filter)
         all_housing_docs.extend(h_docs)
         all_finance_docs.extend(f_docs)
 
@@ -554,6 +653,7 @@ def run_pipeline_top3(
 # ---------------------------------------------------------------------------
 # 6-B. 종합 보고서 생성
 # ---------------------------------------------------------------------------
+@_traceable(name="pipeline_report", run_type="chain")
 def run_pipeline_report(
     question: str,
     top3: List[Dict[str, Any]],
@@ -573,8 +673,202 @@ def run_pipeline_report(
 
 
 # ---------------------------------------------------------------------------
+# 7. 후속 대화 의도 감지
+# ---------------------------------------------------------------------------
+FOLLOWUP_INTENT_PROMPT = """\
+사용자가 Top3 정책 추천 결과를 받은 뒤 추가 메시지를 보냈습니다.
+아래 메시지의 의도를 파악하세요.
+
+[Top3 정책 목록]
+{top3_names}
+
+[사용자 메시지]
+{message}
+
+[의도 분류]
+- "qualify": 자격요건/조건 추가 정보 제공 (나이, 소득, 지역, 무주택 여부, 혼인상태 등)
+- "detail": 특정 정책에 대해 더 자세히 알고 싶다는 요청
+- "other": 그 외
+
+[출력 - JSON만]
+{{
+  "intent": "qualify" | "detail" | "other",
+  "policies": ["정책명1", "정책명2"],
+  "extra": "추출된 자격요건 설명 (qualify일 때)"
+}}
+"""
+
+
+def detect_followup_intent(
+    message: str,
+    top3: List[Dict[str, Any]],
+    model: str | None = None,
+) -> Dict[str, Any]:
+    """후속 메시지 의도 감지: qualify / detail / other."""
+    top3_names = ", ".join(p.get("policy_name", "") for p in top3)
+    chain = (
+        ChatPromptTemplate.from_template(FOLLOWUP_INTENT_PROMPT)
+        | _llm(0.0, model=model)
+        | StrOutputParser()
+    )
+    raw = chain.invoke({"top3_names": top3_names, "message": message})
+    parsed = _extract_json(raw)
+    if not isinstance(parsed, dict):
+        return {"intent": "other", "policies": [], "extra": ""}
+    return {
+        "intent":   parsed.get("intent", "other"),
+        "policies": parsed.get("policies", []) or [],
+        "extra":    parsed.get("extra", "") or "",
+    }
+
+
+# ---------------------------------------------------------------------------
+# 8. 자격요건 기반 정책 필터링
+# ---------------------------------------------------------------------------
+QUALIFY_CHECK_PROMPT = """\
+사용자가 제공한 자격요건 정보를 바탕으로, Top3 정책 각각에 대해
+해당 사용자가 자격이 되는지 판단하세요.
+
+[사용자 자격요건 정보]
+{user_info}
+
+[Top3 정책 및 요약]
+{top3_json}
+
+[참고 컨텍스트]
+{contexts}
+
+[판단 기준]
+- 자격요건이 명확히 충족되지 않는 경우에만 "disqualified"로 표시
+- 정보가 불충분해서 판단 불가한 경우는 "qualified"로 처리
+- 판단 근거를 간단히 설명
+
+[출력 - JSON만]
+[
+  {{
+    "policy_name": "정책명",
+    "status": "qualified" | "disqualified",
+    "reason": "판단 근거 1줄"
+  }}
+]
+"""
+
+
+def check_qualification(
+    user_info: str,
+    top3: List[Dict[str, Any]],
+    contexts: List[str] | None = None,
+    model: str | None = None,
+) -> List[Dict[str, Any]]:
+    """사용자 자격요건 vs Top3 정책 → qualified/disqualified 리스트."""
+    chain = (
+        ChatPromptTemplate.from_template(QUALIFY_CHECK_PROMPT)
+        | _llm(0.0, model=model)
+        | StrOutputParser()
+    )
+    raw = chain.invoke({
+        "user_info":  user_info,
+        "top3_json":  json.dumps(top3, ensure_ascii=False, indent=2),
+        "contexts":   "\n---\n".join(contexts or []) or "(컨텍스트 없음)",
+    })
+    parsed = _extract_json(raw)
+    if isinstance(parsed, list):
+        return parsed
+    return [{"policy_name": p.get("policy_name", ""), "status": "qualified", "reason": ""} for p in top3]
+
+
+# ---------------------------------------------------------------------------
+# 9. 정책 상세 정보 생성
+# ---------------------------------------------------------------------------
+POLICY_DETAIL_PROMPT = """\
+아래 정책에 대해 사용자 관점의 상세 정보를 충분히 길고 구체적으로 작성하세요.
+수치, 금액, 조건, 절차가 컨텍스트에 있다면 반드시 포함하세요.
+
+[사용자 원래 질문]
+{question}
+
+[정책명]
+{policy_name}
+
+[참고 컨텍스트]
+{contexts}
+
+[작성 지침]
+- overview: 정책 목적, 지원 대상, 지원 규모, 운영 기관을 포함해 4~5문장으로 상세히
+- eligibility: 나이·소득·자산·가구형태·무주택 여부 등 각 요건을 수치 포함해 5~7개 항목으로
+- benefits: 지원 금액, 금리, 기간, 한도 등 구체적 수치가 담긴 혜택 4~6개 항목으로
+- how_to_apply: 신청 채널, 단계별 절차, 담당 기관을 구체적으로
+- deadline: 신청 기간, 모집 일정, 선발 방식(선착순/추첨/심사)까지 포함
+- required_docs: 필요 서류를 구체적으로 5~8개 항목으로
+- caution: 자격 박탈 조건, 중복 수혜 제한, 놓치기 쉬운 유의사항을 3~4문장으로
+
+[출력 형식 - JSON만]
+{{
+  "policy_name": "정책명",
+  "category": "주택" 또는 "금융",
+  "overview": "목적·대상·규모·기관 포함 4~5문장",
+  "eligibility": ["나이 조건 (수치 포함)", "소득 조건 (수치 포함)", "자산 조건", "가구형태 조건", "무주택 조건", "기타 조건"],
+  "benefits": ["혜택1 (금액/금리 수치 포함)", "혜택2", "혜택3", "혜택4"],
+  "how_to_apply": "단계별 신청 방법 (채널·절차·담당기관 포함)",
+  "deadline": "신청기간 + 선발방식 포함",
+  "required_docs": ["서류1", "서류2", "서류3", "서류4", "서류5"],
+  "caution": "자격박탈·중복제한·유의사항 3~4문장",
+  "url": "공식 URL (없으면 빈 문자열)"
+}}
+"""
+
+
+def get_policy_detail(
+    question: str,
+    policy_name: str,
+    contexts: List[str] | None = None,
+    model: str | None = None,
+) -> Dict[str, Any]:
+    """특정 정책의 상세 정보 생성."""
+    chain = (
+        ChatPromptTemplate.from_template(POLICY_DETAIL_PROMPT)
+        | _llm(0.2, model=model)
+        | StrOutputParser()
+    )
+    raw = chain.invoke({
+        "question":    question,
+        "policy_name": policy_name,
+        "contexts":    "\n---\n".join(contexts or []) or "(컨텍스트 없음)",
+    })
+    parsed = _extract_json(raw)
+    if isinstance(parsed, dict):
+        return parsed
+    return {"policy_name": policy_name, "overview": raw[:300], "eligibility": [], "benefits": [],
+            "how_to_apply": "", "deadline": "", "required_docs": [], "caution": "", "url": ""}
+
+
+def prefetch_policy_details(
+    question: str,
+    top3: List[Dict[str, Any]],
+    contexts: List[str] | None = None,
+    model: str | None = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Top3 정책 상세 정보를 병렬로 미리 fetch. {policy_name: detail_dict}"""
+    def _fetch(p: Dict) -> tuple:
+        name = p.get("policy_name", "")
+        return name, get_policy_detail(question, name, contexts, model)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+        futures = {ex.submit(_fetch, p): p for p in top3}
+        result: Dict[str, Dict[str, Any]] = {}
+        for fut in concurrent.futures.as_completed(futures):
+            try:
+                name, detail = fut.result()
+                result[name] = detail
+            except Exception:
+                pass
+    return result
+
+
+# ---------------------------------------------------------------------------
 # 6-C. 전체 파이프라인 wrapper (Evaluation 페이지 등 단일 호출용)
 # ---------------------------------------------------------------------------
+@_traceable(name="run_pipeline", run_type="chain")
 def run_pipeline(
     question: str,
     retriever_config: Dict[str, Any],
@@ -583,6 +877,25 @@ def run_pipeline(
 ) -> Dict[str, Any]:
     """6-A + 6-B 를 순서대로 실행하는 wrapper."""
     prompts_dict = prompts_dict or prompt_store.load_prompts()
+
+    # ── LangSmith Run에 리트리버 설정 메타데이터 태깅 ──────────────
+    try:
+        from langsmith.run_helpers import get_current_run_tree as _grt
+        _rt = _grt()
+        if _rt:
+            _units   = retriever_config.get("units", [])
+            _active  = [u for u in _units if u.get("active") and u.get("type") not in (None, "", "미설정")]
+            _rerank  = retriever_config.get("reranker", {})
+            _alias   = retriever_config.get("alias", "unknown")
+            _rt.metadata = {
+                "retriever_alias":   _alias,
+                "retriever_units":   " + ".join(u.get("type", "?") for u in _active),
+                "reranker":          "ON" if _rerank.get("enabled") else "OFF",
+                "reranker_top_n":    _rerank.get("final_k", "-"),
+                "llm_model":         model or retriever_config.get("llm_model", "gpt-4o-mini"),
+            }
+    except Exception:
+        pass
 
     stage1 = run_pipeline_top3(question, retriever_config, prompts_dict, model=model)
     report = run_pipeline_report(question, stage1["top3"], stage1["contexts_text"], prompts_dict, model=model)

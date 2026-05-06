@@ -59,6 +59,19 @@ def get_vectorstore(collection: str, embeddings: Optional[OpenAIEmbeddings] = No
     )
 
 
+try:
+    import streamlit as st
+
+    @st.cache_resource(show_spinner=False)
+    def get_cached_vectorstore(collection: str) -> Chroma:
+        """앱 시작 시 한 번만 로드하고 세션 간 재사용."""
+        return get_vectorstore(collection)
+
+except ImportError:
+    def get_cached_vectorstore(collection: str) -> Chroma:
+        return get_vectorstore(collection)
+
+
 def add_documents(collection: str, docs: Iterable[Document]) -> int:
     docs = list(docs)
     if not docs:

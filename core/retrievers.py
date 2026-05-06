@@ -41,6 +41,23 @@ def load_cross_encoder(model_name: str):
     return HuggingFaceCrossEncoder(model_name=model_name)
 
 
+@st.cache_resource(show_spinner=False)
+def get_cached_bm25_retriever(collection_name: str) -> "BM25Retriever | None":
+    """컬렉션별 BM25 인덱스를 앱 시작 시 한 번만 빌드하고 재사용."""
+    from core.vector_db import get_cached_vectorstore
+    vs = get_cached_vectorstore(collection_name)
+    all_docs = get_all_documents_from_vs(vs)
+    if not all_docs:
+        return None
+    tokenizer = get_kiwi_tokenizer()
+    retriever = (
+        BM25Retriever.from_documents(all_docs, preprocess_func=tokenizer)
+        if tokenizer
+        else BM25Retriever.from_documents(all_docs)
+    )
+    return retriever
+
+
 # ── 경로 ─────────────────────────────────────────────────────────
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 RETRIEVER_CONFIG_FILE = DATA_DIR / "retriever_config.json"
@@ -202,15 +219,23 @@ def build_retriever(vectorstore: Chroma, config: Dict[str, Any], metadata_filter
             )
 
         elif utype == "BM25":
-            all_docs = get_all_documents_from_vs(vectorstore)
-            if all_docs:
-                tokenizer = get_kiwi_tokenizer()
-                retriever = (
-                    BM25Retriever.from_documents(all_docs, preprocess_func=tokenizer)
-                    if tokenizer
-                    else BM25Retriever.from_documents(all_docs)
-                )
+            col_name = getattr(vectorstore, "_collection", None)
+            col_name = col_name.name if col_name else None
+            cached = get_cached_bm25_retriever(col_name) if col_name else None
+            if cached is not None:
+                import copy
+                retriever = copy.copy(cached)
                 retriever.k = k
+            else:
+                all_docs = get_all_documents_from_vs(vectorstore)
+                if all_docs:
+                    tokenizer = get_kiwi_tokenizer()
+                    retriever = (
+                        BM25Retriever.from_documents(all_docs, preprocess_func=tokenizer)
+                        if tokenizer
+                        else BM25Retriever.from_documents(all_docs)
+                    )
+                    retriever.k = k
 
         elif utype == "Multi-Query Retriever":
             base = vectorstore.as_retriever(search_type=stype, search_kwargs=search_kwargs)
@@ -248,18 +273,27 @@ def build_retriever(vectorstore: Chroma, config: Dict[str, Any], metadata_filter
         # 하위 호환: 구형 "Ensemble Retriever" 타입 처리
         elif utype == "Ensemble Retriever":
             base_vs  = vectorstore.as_retriever(search_type=stype, search_kwargs=search_kwargs)
-            all_docs = get_all_documents_from_vs(vectorstore)
-            if all_docs:
-                tokenizer = get_kiwi_tokenizer()
-                base_bm25 = (
-                    BM25Retriever.from_documents(all_docs, preprocess_func=tokenizer)
-                    if tokenizer
-                    else BM25Retriever.from_documents(all_docs)
-                )
+            col_name = getattr(vectorstore, "_collection", None)
+            col_name = col_name.name if col_name else None
+            cached   = get_cached_bm25_retriever(col_name) if col_name else None
+            if cached is not None:
+                import copy
+                base_bm25 = copy.copy(cached)
                 base_bm25.k = k
                 retriever = EnsembleRetriever(retrievers=[base_vs, base_bm25], weights=[0.5, 0.5])
             else:
-                retriever = base_vs
+                all_docs = get_all_documents_from_vs(vectorstore)
+                if all_docs:
+                    tokenizer = get_kiwi_tokenizer()
+                    base_bm25 = (
+                        BM25Retriever.from_documents(all_docs, preprocess_func=tokenizer)
+                        if tokenizer
+                        else BM25Retriever.from_documents(all_docs)
+                    )
+                    base_bm25.k = k
+                    retriever = EnsembleRetriever(retrievers=[base_vs, base_bm25], weights=[0.5, 0.5])
+                else:
+                    retriever = base_vs
 
         if retriever:
             active_retrievers.append(retriever)
