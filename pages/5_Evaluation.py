@@ -3,10 +3,12 @@ st.set_page_config(page_title="Evaluation", layout="wide", initial_sidebar_state
 
 import sys
 import os
+import re
 import time
 import logging
 from pathlib import Path
 import pandas as pd
+from dotenv import load_dotenv
 
 # ChromaDB 텔레메트리 에러 방지 (환경 변수 + 로깅 차단)
 os.environ["ANONYMIZED_TELEMETRY"] = "False"
@@ -16,6 +18,8 @@ logging.getLogger("chromadb").setLevel(logging.ERROR)
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+load_dotenv(ROOT / ".env")
 
 from core.ui import inject_ui, render_page_title
 from core import rag_engine, evaluator, retrievers as retr, prompts as prompt_store
@@ -242,10 +246,14 @@ if run_eval:
 
     import concurrent.futures
 
+    EVAL_MAX_WORKERS = 3
+    EVAL_MAX_RETRIES = 5
+    RATE_LIMIT_MIN_WAIT_SECONDS = 15
+
     cfg          = retr.load_retriever_config()
     prompts_dict = prompt_store.load_prompts()
     results      = []
-    progress     = st.progress(0.0, text="평가 진행 중...")
+    progress     = st.progress(0.0, text=f"평가 진행 중... (동시 실행 {EVAL_MAX_WORKERS}개)")
 
     @_ls_traceable(name="evaluation_case", run_type="chain")
     def _run_and_score(q: str, gt: str) -> dict:
@@ -263,10 +271,16 @@ if run_eval:
             try:
                 rt = _get_rt()
                 if rt:
+                    trace_id = str(getattr(rt, "trace_id", None) or rt.id)
                     for k in ["faithfulness", "answer_relevance", "context_precision", "context_recall"]:
                         v = metrics.get(k)
                         if v is not None:
-                            _ls_client.create_feedback(str(rt.id), key=k, score=float(v))
+                            _ls_client.create_feedback(
+                                run_id=str(rt.id),
+                                trace_id=trace_id,
+                                key=k,
+                                score=float(v),
+                            )
             except Exception:
                 pass
         return {"res": res, "metrics": metrics}
@@ -275,10 +289,9 @@ if run_eval:
         q  = str(case.get("question", "")).strip()
         gt = str(case.get("ground_truth", "")).strip()
 
-        max_retries = 3
         last_error = ""
 
-        for attempt in range(1, max_retries + 1):
+        for attempt in range(1, EVAL_MAX_RETRIES + 1):
             try:
                 # 1. RAG 파이프라인 실행 + 채점 (LangSmith 트레이싱 포함)
                 out     = _run_and_score(q, gt)
@@ -314,16 +327,27 @@ if run_eval:
 
             except Exception as e:
                 last_error = str(e)
-                if attempt < max_retries:
-                    time.sleep(attempt * 2)
+                if attempt < EVAL_MAX_RETRIES:
+                    is_rate_limit = "429" in last_error or "rate_limit" in last_error.lower()
+                    if is_rate_limit:
+                        m = re.search(r"try again in ([\d.]+)(ms|s)", last_error, re.IGNORECASE)
+                        wait = RATE_LIMIT_MIN_WAIT_SECONDS
+                        if m:
+                            retry_after = float(m.group(1))
+                            if m.group(2).lower() == "ms":
+                                retry_after /= 1000
+                            wait = max(wait, retry_after)
+                        time.sleep(wait + attempt)
+                    else:
+                        time.sleep(attempt * 2)
                     continue
                 else:
-                    return {"error": True, "index": i, "question": q, "message": f"질문 #{i} 최종 실패 (3회 시도): {last_error}"}
+                    return {"error": True, "index": i, "question": q, "message": f"질문 #{i} 최종 실패 ({EVAL_MAX_RETRIES}회 시도): {last_error}"}
 
     total_cases = len(test_cases)
     completed_count = 0
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=EVAL_MAX_WORKERS) as executor:
         # Submit all tasks
         futures = [executor.submit(evaluate_single_case, i, case) for i, case in enumerate(test_cases, start=1)]
         
